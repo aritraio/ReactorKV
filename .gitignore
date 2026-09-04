@@ -4,4 +4,7 @@ kvstore_smoke.log
 tests/test_hashmap
 tests/test_protocol
 tests/test_slab
+tests/test_lru
+tests/test_store
+tests/test_expire
 *.dSYM/

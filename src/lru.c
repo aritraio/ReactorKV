@@ -1,3 +1,4 @@
+#include "kvstore/hashmap.h"
 #include "kvstore/lru.h"
 
 void lru_init(lru *l) {
@@ -11,7 +12,7 @@ void lru_push_front(lru *l, kv_entry *e) {
     if (l->head != NULL) {
         l->head->lru_prev = e;
     } else {
-        l->tail = e; /* list was empty */
+        l->tail = e;
     }
     l->head = e;
 }

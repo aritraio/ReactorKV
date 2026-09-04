@@ -6,7 +6,7 @@ portfolio: non-blocking event-driven I/O (`epoll`/`kqueue`), a subset of
 the Redis RESP protocol, a custom allocator, reader-writer-locked
 concurrency, and LRU eviction — all without third-party event libraries.
 
-**Status: Phases 1–3 complete** (see [docs/PHASES.md](docs/PHASES.md) for
+**Status: Phases 1–4 complete** (see [docs/PHASES.md](docs/PHASES.md) for
 the full 5-phase plan).
 
 ## Features (Phase 1)
@@ -53,14 +53,41 @@ the full 5-phase plan).
 - **1 MiB cap**: entries whose key+value footprint exceeds the largest
   class are refused with `-ERR out of memory` instead of stored.
 
+## Features (Phase 4)
+
+- **maxmemory + allkeys-lru**: a configurable byte budget
+  (`-m/--maxmemory`, suffixes `k/m/g` accepted); when live memory exceeds
+  it, least-recently-used entries are evicted — including in-place
+  overwrites that never allocate, which are exempt. A single entry that
+  alone exceeds the budget is refused up front (`-ERR out of memory`).
+- **Active expiry worker**: a background thread wakes every 100 ms
+  (Redis's 10 Hz cadence) and runs a bounded Redis-style sweep with a
+  rotating bucket cursor, so keys given `EXPIRE` are purged even if no
+  client ever reads them again. `-e/--expire-ms 0` disables it.
+- **Reader/writer locking**: `kv_store` is guarded by a `pthread_rwlock`
+  — read-only commands (`GET`/`MGET`/`INFO`) take the read lock for the
+  whole handler (which is what keeps borrowed value pointers valid while
+  replies are built), mutators take the write lock, and the expiry worker
+  holds the write lock only for each bounded pass. One reactor thread +
+  one worker, no data races (`make tsan` clean).
+- **LRU bookkeeping for free**: each `kv_entry` embeds `lru_prev`/
+  `lru_next`, so recency tracking costs no extra allocations — GET hits
+  move the entry to the list head, eviction pops the tail, and the
+  hash map keeps membership in sync across inserts, in-place overwrites,
+  and migrations.
+- **Stats**: `INFO` reports `keys`, `hits`, `misses`, `evictions`,
+  `used_memory`, and `maxmemory` (atomic counters, lock-free to read);
+  the server also logs them every 5 s.
+
 ## Build
 
 ```sh
 make            # builds ./kvstore
-make test       # unit tests (hashmap, protocol, dispatch)
+make test       # unit tests (hashmap, protocol, slab, lru, store, expire)
 make smoke      # end-to-end test over real TCP sockets
 make stress     # smoke + 1,000 concurrent pipelined connections
 make sanitize   # rebuild tests with AddressSanitizer + UBSan, run them
+make tsan       # rebuild the Phase 4 concurrency tests with ThreadSanitizer
 make valgrind   # run tests under valgrind (leak-check=full)
 ```
 
@@ -73,6 +100,8 @@ macOS).
 ```sh
 ./kvstore -p 7379          # listen on 127.0.0.1:7379
 ./kvstore -a 0.0.0.0 -p 7379
+./kvstore -m 256m          # cap memory at 256 MiB, evict LRU tails past it
+./kvstore -e 0             # disable the active expiry worker
 ```
 
 Then, in another terminal:
@@ -83,6 +112,7 @@ redis-cli -p 7379 get foo      # "bar"
 redis-cli -p 7379 incr counter # (integer) 1
 redis-cli -p 7379 expire foo 60
 redis-cli -p 7379 mget foo counter
+redis-cli -p 7379 info        # keys / hits / misses / evictions
 ```
 
 Ctrl-C (or `kill -TERM`) shuts the server down cleanly.
@@ -108,7 +138,8 @@ slotted into the reactor unchanged.
 2. **Phase 2 (done)** — event-driven reactor (`epoll`/`kqueue`),
    non-blocking I/O, 1k-conn stress-verified.
 3. **Phase 3 (done)** — slab allocator (fixed-size classes, no heap fragmentation).
-4. **Phase 4** — LRU eviction + active expiry worker (`pthread_rwlock`).
+4. **Phase 4 (done)** — LRU eviction (`maxmemory`/allkeys-lru), active
+   expiry worker, `pthread_rwlock` concurrency, stats instrumentation.
 5. **Phase 5** — WAL persistence + `memtier_benchmark` benchmarking.
 
 Details, diagrams, and exact struct layouts in

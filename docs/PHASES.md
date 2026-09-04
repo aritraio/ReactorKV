@@ -134,31 +134,71 @@ classes; teardown walks per-class page lists, never chunks.
 
 ---
 
-## Phase 4 — LRU eviction + active expiry workers
+## Phase 4 — LRU eviction + active expiry workers ✅ (shipped)
 
 **Goal.** Bound memory (`maxmemory` policy) and honor TTLs even for keys
 that are never accessed again — the concurrency requirement.
 
 **Deliverables.** `lru.h`/`lru.c`: doubly linked list embedded in
-`kv_entry` (`lru_prev`/`lru_next`), head = most recent; touch on
-GET/SET; evict tail when `maxmemory` high-water is exceeded. `expire.h`/
-`expire.c`: worker thread that periodically samples keys (Redis-style
-random sampling) and purges expired ones; `pthread_rwlock` on the store
-(readers on GET, writers on SET/DEL/evict); config knobs (`maxmemory`,
-`maxmemory-policy allkeys-lru`, expiry interval). Stats: hits, misses,
-evictions, key count.
+`kv_entry` (`lru_prev`/`lru_next`), head = most recent. Membership is
+maintained by the hash map (the single place every entry-lifecycle
+transition happens) whenever the store attaches its `lru` root, so the
+recency list can never go stale; GET hits touch, SET/DEL/migrations keep
+it in sync. `store.h`/`store.c`: `maxmemory` (bytes; 0 = unlimited) with
+`allkeys-lru` eviction of LRU tails after each write, plus a Redis-style
+bounded expiry sweep (`kv_store_expire_cycle`: rotating cursor over
+buckets, then budget enforcement). `expire.h`/`expire.c`: a worker thread
+waking every 100 ms (10 Hz), each pass sampling a slice of the keyspace
+and purging expired entries. Concurrency: one `pthread_rwlock` on
+`kv_store` — read-only commands (`GET`/`MGET`/`INFO`) hold the read lock
+for the whole handler (keeping borrowed value pointers valid while the
+reply is built), mutators hold the write lock, and the worker holds the
+write lock only per bounded pass. Stats (all atomic, lock-free to read):
+`hits`, `misses`, `evictions`, key count, used bytes; surfaced via a new
+`INFO` command and a 5 s server log line. `main.c` gains `-m/--maxmemory
+BYTES` (with `k/m/g` suffixes) and `-e/--expire-ms MS` (0 disables the
+worker).
 
-**Acceptance criteria**
-- With a small `maxmemory` and a working set that exceeds it, RSS stays
-  under the cap and the oldest keys are the ones evicted.
-- A key with `EXPIRE 1` disappears within ~1s without any client touching
-  it.
-- Thread-sanitizer (`-fsanitize=thread`) run of the unit tests passes.
+**Acceptance criteria (all met)**
+- RSS bounded under `maxmemory`: a 512 KiB-value churn stream against an
+  `-m 16m` server peaks ~11.5 MB (one slab chunk of slack) and holds.
+  Unit tests verify oldest-key-first eviction, single-entry-over-budget
+  refusal, and that in-place overwrites (which allocate nothing) never
+  evict.
+- TTL keys vanish without any client touching them: `EXPIRE 1` keys are
+  purged by the worker within ~1 s (verified over TCP with no GETs), and
+  identical 1 MiB churn rounds show 0 kB RSS growth between them — the
+  worker reclaims expired chunks and the slab reuses them.
+- `make tsan` (ThreadSanitizer) passes on the concurrency suite, which
+  hammers the store from a reactor-style thread (write-lock SETs,
+  read-lock GETs) while the worker runs — no data races. `make test`
+  green (hashmap 30,042 + protocol 142 + slab 60,347 + lru 66 + store 106
+  + expire 731 checks); `make sanitize` (ASan+UBSan) clean; `make smoke`
+  and `make stress` (1,000 conns / 40k requests) byte-exact with clean
+  shutdown.
 
-**Risks.** Lock contention between the reactor and worker — keep the worker
-batch-oriented and hold the write lock briefly; `volatile sig_atomic_t`
-stop flag for worker shutdown; clock jumps (use `CLOCK_REALTIME` per Redis,
-document).
+**Notes / deviations from the plan.**
+- Expiry sweep uses a rotating bucket *cursor* (deterministic full
+  coverage) rather than random sampling per se; the per-pass budget is
+  capped (4096) so huge tables can't monopolize CPU, and scales with key
+  count so small tables are fully swept every interval.
+- The worker's sweep budget is derived from the lock-free key count
+  (`keys/10`, min. configured sample) so a full keyspace sweep takes ~1 s
+  at the default cadence.
+- Reads of expired keys return a miss but never mutate (no purge on
+  GET): expired-but-present entries are left strictly to the worker.
+  `INFO` key counts can therefore briefly include an expired entry
+  awaiting its sweep.
+- Eviction counts only `maxmemory` policy evictions; expiry purges are
+  tracked separately (never inflate `evictions`).
+
+**Risks addressed.** Lock granularity: GET borrows slab memory into the
+reply, so the read lock spans handler execution — with one reactor thread
+readers never contend with each other, and recency touches under the read
+lock are safe. Worker shutdown uses an `atomic_bool` + `pthread_join`
+before the store is destroyed. Wall-clock expiry (`CLOCK_REALTIME`) is
+kept per Redis EXPIRE semantics (documented; clock jumps can only advance
+or delay purge).
 
 ---
 
@@ -192,5 +232,6 @@ growth (add compaction/rotation as a stretch goal).
 1. Phase 1 complete — commit and tag `phase-1`.
 2. Phase 2 complete — `evloop` + reactor server; blocking loop deleted.
 3. Phase 3: slab ships; `make test` unchanged.
-4. Phase 4: LRU + worker; `make test` unchanged, add expiry/eviction tests.
+4. Phase 4 (done): LRU + worker + rwlock + INFO stats; new lru/store/expire
+   tests, `make tsan` target.
 5. Phase 5: WAL + `docs/BENCHMARKS.md`.

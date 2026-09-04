@@ -109,6 +109,6 @@ void hashmap_foreach(hashmap *h, hashmap_iter_fn fn, void *ctx);
 
 /* Return an entry obtained from hashmap_del()/hashmap_unlink() to its slab
    chunk. */
-void hashmap_entry_free(const hashmap *h, kv_entry *e);
+void hashmap_entry_free(hashmap *h, kv_entry *e);
 
 #endif /* KVC_HASHMAP_H */

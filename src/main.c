@@ -1,6 +1,8 @@
 #include "kvstore/common.h"
 #include "kvstore/server.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,18 +31,45 @@ static void raise_fd_limit(void) {
     }
 }
 
+/* Parse a byte count with an optional k/m/g (KiB/MiB/GiB) suffix.
+   Returns -1 on malformed input or overflow. */
+static long long parse_size(const char *s) {
+    errno = 0;
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (errno != 0 || end == s) return -1;
+    long long mult = 1;
+    if (*end != '\0') {
+        switch (*end) {
+        case 'k': case 'K': mult = 1024LL; break;
+        case 'm': case 'M': mult = 1024LL * 1024; break;
+        case 'g': case 'G': mult = 1024LL * 1024 * 1024; break;
+        default: return -1;
+        }
+        if (end[1] != '\0') return -1;
+    }
+    if (v < 0 || v > LLONG_MAX / mult) return -1;
+    return v * mult;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
-            "usage: %s [-p PORT] [-a ADDR]\n"
-            "  -p PORT   listen port (default 6379)\n"
-            "  -a ADDR   bind address (default 127.0.0.1; '*' = all)\n"
-            "  -h        this help\n",
+            "usage: %s [-p PORT] [-a ADDR] [-m BYTES] [-e MS]\n"
+            "  -p PORT       listen port (default 6379)\n"
+            "  -a ADDR       bind address (default 127.0.0.1; '*' = all)\n"
+            "  -m BYTES      maxmemory budget; evicts LRU tails past it\n"
+            "                (0 = unlimited; suffixes k/m/g accepted)\n"
+            "  -e MS         active-expiry worker cadence; 0 disables it\n"
+            "                (default 100)\n"
+            "  -h            this help\n",
             prog);
 }
 
 int main(int argc, char **argv) {
     int port = 6379;
     const char *addr = "127.0.0.1";
+    size_t maxmemory = 0;   /* 0 = unlimited */
+    long expire_ms = KVC_EXPIRE_INTERVAL_MS_DEFAULT;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) &&
@@ -49,6 +78,22 @@ int main(int argc, char **argv) {
         } else if ((strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--addr") == 0) &&
                    i + 1 < argc) {
             addr = argv[++i];
+        } else if ((strcmp(argv[i], "-m") == 0 ||
+                    strcmp(argv[i], "--maxmemory") == 0) && i + 1 < argc) {
+            long long v = parse_size(argv[++i]);
+            if (v < 0) {
+                fprintf(stderr, "invalid maxmemory: %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            maxmemory = (size_t)v;
+        } else if ((strcmp(argv[i], "-e") == 0 ||
+                    strcmp(argv[i], "--expire-ms") == 0) && i + 1 < argc) {
+            long v = atol(argv[++i]);
+            if (v < 0) {
+                fprintf(stderr, "invalid expire interval: %s\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            expire_ms = v;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return EXIT_SUCCESS;
@@ -83,7 +128,11 @@ int main(int argc, char **argv) {
     if (kv_server_init(&srv, addr, port) != KVC_OK) {
         return EXIT_FAILURE;
     }
-    kvc_log(KVC_LOG_INFO, "kvstore ready on %s:%d", addr, port);
+    srv.maxmemory = maxmemory;
+    srv.expire_interval_ms = expire_ms;
+    kvc_log(KVC_LOG_INFO, "kvstore ready on %s:%d (maxmemory=%zu bytes%s)",
+            addr, port, maxmemory,
+            expire_ms > 0 ? ", expiry worker on" : ", expiry worker off");
 
     int rc = kv_server_run(&srv);
 

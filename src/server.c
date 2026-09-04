@@ -65,6 +65,12 @@ kvc_err kv_server_init(kv_server *srv, const char *addr, int port) {
     srv->max_conns = KVC_DEFAULT_MAX_CONNS;
     KVC_RET_ERR(kv_store_init(&srv->store, 16));
 
+    /* Phase 4 defaults: unlimited memory, active expiry at 10 Hz. */
+    srv->maxmemory = 0;
+    srv->expire_interval_ms = KVC_EXPIRE_INTERVAL_MS_DEFAULT;
+    srv->expire_sample = KVC_EXPIRE_SAMPLE_DEFAULT;
+    atomic_init(&srv->expire.stop, false);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         kvc_log(KVC_LOG_ERR, "socket(): %s", strerror(errno));
@@ -108,6 +114,8 @@ kvc_err kv_server_init(kv_server *srv, const char *addr, int port) {
 
 void kv_server_destroy(kv_server *srv) {
     if (srv == NULL) return;
+    /* Stop the active expiry worker before touching the store it reads. */
+    expire_worker_stop(&srv->expire);
     if (srv->el != NULL) {
         kv_evloop_destroy(srv->el);
         srv->el = NULL;
@@ -439,13 +447,15 @@ static void on_fd_event(kv_evloop *el, int fd, uint32_t flags, void *arg) {
 /* Periodic stats: key count from the store (cheap) + conn/request counters. */
 static void on_stats_timer(kv_evloop *el, void *arg) {
     kv_server *srv = (kv_server *)arg;
-    size_t keys = 0;
-    kv_store_stats(&srv->store, &keys);
+    kv_stats st;
+    kv_store_stats(&srv->store, &st);
     kvc_log(KVC_LOG_INFO,
-            "stats: keys=%zu conns=%d peak=%d accepted=%" PRIu64
-            " requests=%" PRIu64,
-            keys, srv->live_conns, srv->peak_conns, srv->total_accepted,
-            srv->requests_processed);
+            "stats: keys=%zu hits=%" PRIu64 " misses=%" PRIu64
+            " evictions=%" PRIu64 " used=%zu maxmemory=%zu"
+            " conns=%d peak=%d accepted=%" PRIu64 " requests=%" PRIu64,
+            st.keys, st.hits, st.misses, st.evictions, st.used_bytes,
+            st.maxmemory, srv->live_conns, srv->peak_conns,
+            srv->total_accepted, srv->requests_processed);
     KVC_UNUSED(el);
 }
 
@@ -463,6 +473,16 @@ int kv_server_run(kv_server *srv) {
                             srv) != KVC_OK) {
         return 1;
     }
+
+    /* Phase 4: apply the memory budget and start the active expiry
+       worker. kv_server_destroy() stops it (before the store dies). */
+    kv_store_set_maxmemory(&srv->store, srv->maxmemory);
+    if (expire_worker_start(&srv->expire, &srv->store,
+                            srv->expire_interval_ms,
+                            srv->expire_sample) != KVC_OK) {
+        return 1;
+    }
+
     int rc = kv_evloop_run(srv->el);
     kvc_log(KVC_LOG_INFO,
             "shutdown: peak conns %d, accepted %" PRIu64 ", processed %" PRIu64,

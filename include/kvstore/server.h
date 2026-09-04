@@ -5,12 +5,14 @@
  * server.h — TCP server. Phase 2: a single-threaded reactor over the
  * evloop — non-blocking listener + connections, level-triggered interest
  * managed by sync_interests() in server.c. kv_server_init sets up the
- * socket and store; kv_server_run starts the event loop; kv_server_destroy
- * tears everything down (loop, connections, store) with zero leaks.
+ * socket and store; kv_server_run starts the event loop (and, Phase 4, the
+ * active expiry worker); kv_server_destroy tears everything down (worker,
+ * loop, connections, store) with zero leaks.
  */
 
 #include "common.h"
 #include "evloop.h"
+#include "expire.h"
 #include "store.h"
 
 /* Cap on simultaneous connections (fd exhaustion mitigation). Because
@@ -34,6 +36,12 @@ typedef struct kv_server {
 
     uint64_t total_accepted;     /* stats */
     uint64_t requests_processed; /* stats */
+
+    /* Phase 4 config + worker. */
+    size_t        maxmemory;         /* bytes; 0 = unlimited */
+    long          expire_interval_ms;/* worker cadence; 0 disables */
+    size_t        expire_sample;     /* keys sampled per worker pass */
+    expire_worker expire;            /* active expiry worker */
 } kv_server;
 
 /* Create the listening socket (SO_REUSEADDR, bind, listen, non-blocking).

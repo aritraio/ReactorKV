@@ -4,7 +4,8 @@
 
 typedef struct command {
     const char *name;
-    int arity; /* > 0: exact argc; < 0: minimum argc = -arity */
+    int arity;  /* > 0: exact argc; < 0: minimum argc = -arity */
+    bool write; /* true: mutates the store (write lock); false: read lock */
     kvc_err (*handler)(kv_store *s, int argc, char **argv,
                        const size_t *argvlen, resp_reply *out);
 } command;
@@ -96,16 +97,42 @@ static kvc_err cmd_ping(kv_store *s, int argc, char **argv,
     return resp_reply_simple(out, "PONG");
 }
 
+/* INFO — snapshot of the store stats (Phase 4 instrumentation). Returns a
+   bulk string of key:value lines, redis-cli INFO-compatible enough. */
+static kvc_err cmd_info(kv_store *s, int argc, char **argv,
+                        const size_t *argvlen, resp_reply *out) {
+    (void)argc; (void)argv; (void)argvlen;
+    kv_stats st;
+    kv_store_stats(s, &st);
+    char buf[512];
+    int n = snprintf(buf, sizeof buf,
+                     "# Server\r\n"
+                     "kvstore_version:0.4.0-phase4\r\n"
+                     "# Stats\r\n"
+                     "keys:%zu\r\n"
+                     "hits:%" PRIu64 "\r\n"
+                     "misses:%" PRIu64 "\r\n"
+                     "evictions:%" PRIu64 "\r\n"
+                     "used_memory:%zu\r\n"
+                     "maxmemory:%zu\r\n",
+                     st.keys, st.hits, st.misses, st.evictions,
+                     st.used_bytes, st.maxmemory);
+    if (n < 0) return KVC_ERR_IO;
+    return resp_reply_bulk(out, buf, (size_t)n);
+}
+
 /* PING is outside the requested command subset but costs nothing and makes
-   the server compatible with redis-cli health checks. */
+   the server compatible with redis-cli health checks. INFO exposes the
+   Phase 4 stats (keys/hits/misses/evictions) for monitoring. */
 static const command commands[] = {
-    { "set",    3,  cmd_set },
-    { "get",    2,  cmd_get },
-    { "del",   -2,  cmd_del },
-    { "expire", 3,  cmd_expire },
-    { "incr",   2,  cmd_incr },
-    { "mget",  -2,  cmd_mget },
-    { "ping",   1,  cmd_ping },
+    { "set",    3,  true,  cmd_set },
+    { "get",    2,  false, cmd_get },
+    { "del",   -2,  true,  cmd_del },
+    { "expire", 3,  true,  cmd_expire },
+    { "incr",   2,  true,  cmd_incr },
+    { "mget",  -2,  false, cmd_mget },
+    { "ping",   1,  false, cmd_ping },
+    { "info",   1,  false, cmd_info },
 };
 
 kvc_err kv_dispatch(kv_store *s, int argc, char **argv,
@@ -129,5 +156,17 @@ kvc_err kv_dispatch(kv_store *s, int argc, char **argv,
                  "ERR wrong number of arguments for '%s' command", cmd->name);
         return resp_reply_error(out, msg);
     }
-    return cmd->handler(s, argc, argv, argvlen, out);
+
+    /* Phase 4: hold the store lock for the whole handler so borrowed
+       pointers (GET value buffers) stay valid while the reply is built.
+       Read-only commands take the read lock; mutators take the write
+       lock, which also serializes them against the expiry worker. */
+    if (cmd->write) {
+        kv_store_wrlock(s);
+    } else {
+        kv_store_rdlock(s);
+    }
+    kvc_err rc = cmd->handler(s, argc, argv, argvlen, out);
+    kv_store_unlock(s);
+    return rc;
 }

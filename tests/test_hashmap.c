@@ -79,26 +79,30 @@ static void test_overwrite_grows_across_class(void) {
     char big[200];
     memset(big, 'a', sizeof big);
 
+    /* Header is 48 B in Phase 4 (LRU links added), so 48+1+40 = 89 B fits
+       the 128 B class. */
     kv_entry *first = NULL;
     CHECK(hashmap_set(&e.h, "k", 1, big, 40, &first) == KVC_OK);
     first->expire_at_ms = 123456789; /* simulate a TTL set by the store */
 
-    /* Growth that still fits the 128-byte chunk stays in place. */
+    /* Growth that still fits the 128-byte chunk stays in place
+       (48+1+70 = 119 <= 128). */
     kv_entry *ent = NULL;
-    CHECK(hashmap_set(&e.h, "k", 1, big, 90, &ent) == KVC_OK);
+    CHECK(hashmap_set(&e.h, "k", 1, big, 70, &ent) == KVC_OK);
     CHECK(ent == first);
-    CHECK(ent->value_len == 90);
+    CHECK(ent->value_len == 70);
 
-    /* Growth past the chunk forces a migration to a fresh entry. */
-    CHECK(hashmap_set(&e.h, "k", 1, big, 160, &ent) == KVC_OK);
+    /* Growth past the chunk (48+1+90 = 139 > 128) forces a migration to a
+       fresh entry. */
+    CHECK(hashmap_set(&e.h, "k", 1, big, 90, &ent) == KVC_OK);
     CHECK(ent != first);
-    CHECK(ent->value_len == 160);
+    CHECK(ent->value_len == 90);
     CHECK(ent->expire_at_ms == 123456789); /* TTL carried across the move */
     CHECK(hashmap_count(&e.h) == 1);
 
     /* The new entry is findable and the old one is gone from the table. */
     CHECK(hashmap_get(&e.h, "k", 1, &ent) == KVC_OK);
-    CHECK(ent->value_len == 160 && memcmp(KV_ENTRY_VALUE(ent), big, 160) == 0);
+    CHECK(ent->value_len == 90 && memcmp(KV_ENTRY_VALUE(ent), big, 90) == 0);
 
     env_destroy(&e);
 }
