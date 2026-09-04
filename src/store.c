@@ -2,20 +2,26 @@
 
 kvc_err kv_store_init(kv_store *s, size_t nbuckets) {
     memset(s, 0, sizeof *s);
-    return hashmap_init(&s->table, nbuckets ? nbuckets : 16);
+    kvc_err rc = slab_allocator_init(&s->slab);
+    if (rc != KVC_OK) return rc;
+    return hashmap_init(&s->table, nbuckets ? nbuckets : 16, &s->slab);
 }
 
-void kv_store_destroy(kv_store *s) { hashmap_destroy(&s->table); }
+void kv_store_destroy(kv_store *s) {
+    hashmap_destroy(&s->table);   /* returns every entry chunk to the slab */
+    slab_allocator_destroy(&s->slab); /* munmap all pages */
+}
 
 static bool entry_expired(const kv_entry *e) {
     return e->expire_at_ms > 0 && kvc_now_ms() >= e->expire_at_ms;
 }
 
-/* Remove a key from the table and free its entry (helper for lazy expiry). */
+/* Remove a key from the table and return its chunk to the slab (helper
+   for lazy expiry). */
 static void purge(kv_store *s, const char *key, size_t key_len) {
     kv_entry *gone = NULL;
     (void)hashmap_del(&s->table, key, key_len, &gone);
-    kv_entry_free(gone);
+    hashmap_entry_free(&s->table, gone);
 }
 
 kvc_err kv_store_set(kv_store *s, const char *key, size_t key_len,
@@ -37,8 +43,8 @@ kvc_err kv_store_get(kv_store *s, const char *key, size_t key_len,
         purge(s, key, key_len); /* lazy expiration: purge on access */
         return KVC_ERR_NOTFOUND;
     }
-    *val = e->value;
-    *val_len = e->value_len;
+    *val = KV_ENTRY_VALUE(e);
+    *val_len = (size_t)e->value_len;
     return KVC_OK;
 }
 
@@ -85,7 +91,7 @@ kvc_err kv_store_incr(kv_store *s, const char *key, size_t key_len, int64_t *out
     }
     if (rc != KVC_OK) return rc;
     int64_t cur = 0;
-    if (kvc_parse_int64(e->value, e->value_len, &cur) != KVC_OK) {
+    if (kvc_parse_int64(KV_ENTRY_VALUE(e), (size_t)e->value_len, &cur) != KVC_OK) {
         return KVC_ERR_INVAL;
     }
     if (cur == INT64_MAX) return KVC_ERR_INVAL; /* increment would overflow */
@@ -94,8 +100,9 @@ kvc_err kv_store_incr(kv_store *s, const char *key, size_t key_len, int64_t *out
     int n = snprintf(buf, sizeof buf, "%" PRId64, next);
     if (n < 0) return KVC_ERR_IO;
     KVC_RET_ERR(hashmap_set(&s->table, key, key_len, buf, (size_t)n, &e));
-    /* Note: INCR keeps an existing TTL (only SET clears it). hashmap_set
-       replaced the value in place and did not touch expire_at_ms. */
+    /* INCR keeps an existing TTL (only SET clears it): hashmap_set updated
+       the value in place when it fit and carried expire_at_ms over when a
+       grow forced a fresh chunk, so it is untouched either way. */
     *out = next;
     return KVC_OK;
 }

@@ -6,7 +6,7 @@ portfolio: non-blocking event-driven I/O (`epoll`/`kqueue`), a subset of
 the Redis RESP protocol, a custom allocator, reader-writer-locked
 concurrency, and LRU eviction — all without third-party event libraries.
 
-**Status: Phases 1–2 complete** (see [docs/PHASES.md](docs/PHASES.md) for
+**Status: Phases 1–3 complete** (see [docs/PHASES.md](docs/PHASES.md) for
 the full 5-phase plan).
 
 ## Features (Phase 1)
@@ -35,6 +35,23 @@ the full 5-phase plan).
   SET/GET complete byte-exact (`make stress` — ~40k requests in ~2s).
 - **Periodic timers**: `timerfd` (Linux) / `EVFILT_TIMER` (macOS) driving
   the stats heartbeat; the same mechanism hosts the Phase 4 expiry worker.
+
+## Features (Phase 3)
+
+- **Slab allocator**: 15 fixed power-of-two size classes (64 B … 1 MiB),
+  each with a singly linked free list (the free pointer lives inside the
+  free chunk) and lazily `mmap`'d 1 MiB pages — the hot path never touches
+  the heap and pages are reused, so RSS stays flat under churn.
+- **Single-chunk entries**: `kv_entry` is one flexible-payload slab chunk
+  (`data[]` holds key + value, binary-safe, not NUL-terminated), replacing
+  the three `malloc`/`strdup` calls Phase 1 made per entry. Chain pointers
+  point straight at slab chunks.
+- **In-place overwrites**: a value that still fits its entry's chunk is
+  updated in place (entry identity preserved — the Phase 4 LRU hook); one
+  that outgrows the chunk migrates to a larger chunk, carrying its TTL
+  across.
+- **1 MiB cap**: entries whose key+value footprint exceeds the largest
+  class are refused with `-ERR out of memory` instead of stored.
 
 ## Build
 
@@ -90,7 +107,7 @@ slotted into the reactor unchanged.
    memory checks.
 2. **Phase 2 (done)** — event-driven reactor (`epoll`/`kqueue`),
    non-blocking I/O, 1k-conn stress-verified.
-3. **Phase 3** — slab allocator (fixed-size classes, no heap fragmentation).
+3. **Phase 3 (done)** — slab allocator (fixed-size classes, no heap fragmentation).
 4. **Phase 4** — LRU eviction + active expiry worker (`pthread_rwlock`).
 5. **Phase 5** — WAL persistence + `memtier_benchmark` benchmarking.
 

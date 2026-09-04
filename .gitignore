@@ -1,6 +1,7 @@
 *.o
-kvstore
+/kvstore
 kvstore_smoke.log
 tests/test_hashmap
 tests/test_protocol
+tests/test_slab
 *.dSYM/

@@ -16,10 +16,10 @@ else
     EVLOOP_BACKEND = src/evloop_kqueue.c
 endif
 
-SRCS      = src/main.c src/util.c src/hashmap.c src/protocol.c src/store.c \
-            src/commands.c src/server.c $(EVLOOP_BACKEND)
+SRCS      = src/main.c src/util.c src/slab.c src/hashmap.c src/protocol.c \
+            src/store.c src/commands.c src/server.c $(EVLOOP_BACKEND)
 OBJS      = $(SRCS:.c=.o)
-TESTS     = tests/test_hashmap tests/test_protocol
+TESTS     = tests/test_hashmap tests/test_protocol tests/test_slab
 
 all: $(BIN)
 
@@ -29,15 +29,19 @@ $(BIN): $(OBJS)
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) $(INCLUDES) -c -o $@ $<
 
-tests/test_hashmap: tests/test_hashmap.c src/hashmap.c src/util.c
-	$(CC) $(TEST_CFLAGS) $(INCLUDES) -o $@ tests/test_hashmap.c src/hashmap.c src/util.c
+tests/test_hashmap: tests/test_hashmap.c src/hashmap.c src/slab.c src/util.c
+	$(CC) $(TEST_CFLAGS) $(INCLUDES) -o $@ tests/test_hashmap.c src/hashmap.c src/slab.c src/util.c
 
-tests/test_protocol: tests/test_protocol.c src/protocol.c src/commands.c src/store.c src/hashmap.c src/util.c
-	$(CC) $(TEST_CFLAGS) $(INCLUDES) -o $@ tests/test_protocol.c src/protocol.c src/commands.c src/store.c src/hashmap.c src/util.c
+tests/test_protocol: tests/test_protocol.c src/protocol.c src/commands.c src/store.c src/hashmap.c src/slab.c src/util.c
+	$(CC) $(TEST_CFLAGS) $(INCLUDES) -o $@ tests/test_protocol.c src/protocol.c src/commands.c src/store.c src/hashmap.c src/slab.c src/util.c
+
+tests/test_slab: tests/test_slab.c src/slab.c src/util.c
+	$(CC) $(TEST_CFLAGS) $(INCLUDES) -o $@ tests/test_slab.c src/slab.c src/util.c
 
 test: $(TESTS)
 	./tests/test_hashmap
 	./tests/test_protocol
+	./tests/test_slab
 
 smoke: $(BIN)
 	python3 tests/smoke.py
@@ -54,6 +58,7 @@ sanitize:
 valgrind: $(TESTS)
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./tests/test_hashmap
 	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./tests/test_protocol
+	valgrind --leak-check=full --show-leak-kinds=all --error-exitcode=1 ./tests/test_slab
 
 clean:
 	rm -f $(BIN) $(OBJS) $(TESTS)

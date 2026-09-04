@@ -6,6 +6,7 @@
 #include "kvstore/store.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -266,6 +267,45 @@ static void test_dispatch(void) {
     kv_store_destroy(&store);
 }
 
+/* Phase 3: an entry whose key+value footprint exceeds the slab allocator's
+   1 MiB cap is refused with an error reply rather than silently dropped. */
+static void test_dispatch_oversized_value(void) {
+    kv_store store;
+    kv_store_init(&store, 4);
+    resp_reply r;
+    resp_reply_init(&r);
+
+    const size_t vlen = 2u * 1024u * 1024u; /* well past the 1 MiB cap */
+    const char *prefix = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$";
+    const char *suffix = "\r\n";
+    char lenbuf[32];
+    int ln = snprintf(lenbuf, sizeof lenbuf, "%zu\r\n", vlen);
+    size_t wire_len = strlen(prefix) + (size_t)ln + vlen + strlen(suffix);
+    char *wire = malloc(wire_len);
+    CHECK(wire != NULL);
+    char *p = wire;
+    memcpy(p, prefix, strlen(prefix));
+    p += strlen(prefix);
+    memcpy(p, lenbuf, (size_t)ln);
+    p += (size_t)ln;
+    memset(p, 'x', vlen);
+    p += vlen;
+    memcpy(p, suffix, strlen(suffix));
+
+    resp_parser prs;
+    resp_parser_init(&prs);
+    CHECK(resp_parser_feed(&prs, wire, wire_len) == 1);
+    CHECK(prs.argc == 3);
+    resp_reply_clear(&r);
+    (void)kv_dispatch(&store, prs.argc, prs.argv, prs.argvlen, &r);
+    check_reply_bytes(&r, "-ERR out of memory\r\n");
+    resp_parser_destroy(&prs);
+    free(wire);
+
+    resp_reply_destroy(&r);
+    kv_store_destroy(&store);
+}
+
 int main(void) {
     test_parse_full();
     test_parse_incremental();
@@ -275,6 +315,7 @@ int main(void) {
     test_parser_clear_on_reuse();
     test_replies();
     test_dispatch();
+    test_dispatch_oversized_value();
     printf("test_protocol: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

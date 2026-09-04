@@ -13,7 +13,13 @@ static kvc_err cmd_set(kv_store *s, int argc, char **argv,
                        const size_t *argvlen, resp_reply *out) {
     (void)argc;
     int created = 0;
-    KVC_RET_ERR(kv_store_set(s, argv[1], argvlen[1], argv[2], argvlen[2], &created));
+    kvc_err rc = kv_store_set(s, argv[1], argvlen[1], argv[2], argvlen[2],
+                              &created);
+    if (rc == KVC_ERR_NOMEM) {
+        /* Phase 3: an entry footprint past the slab's 1 MiB cap. */
+        return resp_reply_error(out, "ERR out of memory");
+    }
+    KVC_RET_ERR(rc);
     return resp_reply_simple(out, "OK");
 }
 
@@ -58,6 +64,9 @@ static kvc_err cmd_incr(kv_store *s, int argc, char **argv,
     kvc_err rc = kv_store_incr(s, argv[1], argvlen[1], &v);
     if (rc == KVC_ERR_INVAL) {
         return resp_reply_error(out, "ERR value is not an integer or out of range");
+    }
+    if (rc == KVC_ERR_NOMEM) {
+        return resp_reply_error(out, "ERR out of memory");
     }
     KVC_RET_ERR(rc);
     return resp_reply_integer(out, v);

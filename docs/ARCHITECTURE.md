@@ -84,6 +84,7 @@ re-runs the state machine against buffered bytes.
 | Module          | Files                       | Responsibility                                        |
 |-----------------|-----------------------------|-------------------------------------------------------|
 | common          | `include/kvstore/common.h`, `src/util.c` | Error codes, checked allocators, logging, time, int parsing |
+| slab            | `include/kvstore/slab.h`, `src/slab.c` | Fixed-size-class allocator (Phase 3): mmap'd pages, per-class free lists |
 | hash map        | `hashmap.h`, `src/hashmap.c` | Binary-safe chained hash table with load-factor rehash |
 | protocol        | `protocol.h`, `src/protocol.c` | Incremental RESP parser + reply writer               |
 | store           | `store.h`, `src/store.c`     | Command semantics (TTL rules, INCR parsing, lazy expiry) |
@@ -91,32 +92,49 @@ re-runs the state machine against buffered bytes.
 | server          | `server.h`, `src/server.c`   | Socket lifecycle, accept loop, client I/O            |
 | main            | `src/main.c`                 | Args, signals, lifecycle                              |
 
-Dependency direction: `main → server → commands → store → hashmap`,
-`server → protocol`. Lower layers never depend on higher ones, so the
-protocol parser and store can be unit-tested and later reused by the event
-loop untouched.
+Dependency direction: `main → server → commands → store → hashmap → slab`
+(with `store → slab` for the allocator it owns), `server → protocol`.
+Lower layers never depend on higher ones, so the protocol parser and
+store can be unit-tested and later reused by the event loop untouched.
 
 ## Data structures (current + planned)
 
-### Phase 1 — shipped
+### Store — entry + hash map (current, Phase 3 shape)
+
+Each entry is a **single flexible-payload slab chunk**: the header, key
+bytes, and value bytes share one allocation, so SET/DEL never touch the
+heap and hash-chain pointers point straight at slab chunks. Nothing is
+NUL-terminated — lengths are authoritative (binary-safe). `chunk_sz` is
+the total chunk size, recorded at allocation so `slab_free` finds the
+right size class and so an overwrite can tell whether the new value fits
+in place:
 
 ```c
 /* hashmap.h */
 struct kv_entry {
-    char            *key;        /* NUL-terminated for convenience */
-    size_t           key_len;    /* authoritative, binary-safe */
-    char            *value;
-    size_t           value_len;
+    uint32_t         key_len;      /* key bytes at data[0, key_len) */
+    uint32_t         value_len;    /* value bytes at data[key_len, ...) */
+    uint32_t         chunk_sz;     /* slab chunk size backing this entry */
     int64_t          expire_at_ms; /* 0 == never; wall clock */
-    struct kv_entry *next;       /* hash-chain link */
+    struct kv_entry *next;         /* hash-chain link */
+    char             data[];       /* key bytes, then value bytes */
 };
+/* KV_ENTRY_KEY(e) / KV_ENTRY_VALUE(e) give the byte ranges in data[] */
+
 typedef struct hashmap {
-    kv_entry **buckets;          /* power-of-two count */
-    size_t     nbuckets;
-    size_t     count;
-    size_t     max_load;         /* rehash at count >= nbuckets * 3/4 */
+    kv_entry       **buckets;      /* power-of-two count */
+    size_t           nbuckets;
+    size_t           count;
+    size_t           max_load;     /* rehash at count >= nbuckets * 3/4 */
+    slab_allocator  *slab;         /* entry chunks come from here */
 } hashmap;
 ```
+
+Overwrite semantics: if the new key+value footprint fits the entry's
+current chunk, the value is updated in place and the entry object is kept
+(the Phase 4 LRU hook). If it outgrows the chunk, the entry migrates to a
+fresh, larger chunk — the bucket link is rewired, `expire_at_ms` is
+carried across, and the old chunk is returned to the slab.
 
 ### Phase 2 — event loop (shipped)
 
@@ -166,39 +184,50 @@ Reactor invariants (`server.c`):
   the next one and corrupt parsing. `resp_parser_reset()` keeps the buffer
   deliberately, for pipelined drain.
 
-### Phase 3 — slab allocator
+### Phase 3 — slab allocator (current)
+
+Power-of-two size classes from 64 B to 1 MiB (2^6 … 2^20 — **15** classes;
+64 B … 1 MiB contains 15 powers of two, not the 16 the plan sketch
+estimated). Each class owns a free list (the next pointer lives inside the
+free chunk, so free lists cost nothing extra) and a list of the ~1 MiB
+`mmap`'d pages it has grown lazily; `slab_allocator_destroy` walks the
+page lists and `munmap`s everything:
 
 ```c
-/* slab.h (new in Phase 3) */
-#define SLAB_CLASS_COUNT 16      /* e.g. 64B … 1 MiB, power-of-two */
+/* slab.h */
+#define SLAB_CLASS_COUNT 15
+#define SLAB_MIN_CHUNK  64u
+#define SLAB_MAX_CHUNK  (1024u * 1024u)
+#define SLAB_PAGE_TARGET (1024u * 1024u) /* ~1 MiB of chunks per page */
+
+typedef struct slab_page {
+    struct slab_page *next;    /* next page of the same class */
+    void             *mem;     /* mmap'd chunk area (page-aligned) */
+    size_t            mem_len; /* bytes mapped (for munmap) */
+} slab_page;
 
 typedef struct slab_class {
-    size_t chunk_size;           /* payload capacity per item */
-    size_t chunks_per_page;      /* chunks per mmap'd slab page */
-    void  *free_head;            /* singly-linked free list */
-    struct slab_page *pages;     /* list of pages (for teardown) */
-    size_t pages_count, used;
+    size_t     chunk_size;      /* class size in bytes */
+    size_t     chunks_per_page;
+    void      *free_head;       /* singly linked free list */
+    slab_page *pages;           /* teardown list */
+    size_t     total_chunks;    /* chunks ever handed to the free list */
+    size_t     free_chunks;     /* chunks currently free */
 } slab_class;
 
-typedef struct slab_allocator {
+struct slab_allocator {
     slab_class classes[SLAB_CLASS_COUNT];
-    /* stats: total_mapped, total_allocated */
-} slab_allocator;
-```
-
-Phase 3 also consolidates the entry: key and value become one flexible
-payload inside a single slab chunk (memcached-style), replacing the three
-separate mallocs per entry from Phase 1:
-
-```c
-struct kv_entry {                /* Phase 3 shape */
-    uint32_t key_len, value_len;
-    int64_t  expire_at_ms;
-    struct kv_entry *next;       /* hash chain */
-    struct kv_entry *lru_prev, *lru_next;   /* Phase 4 */
-    char data[];                 /* key bytes, then value bytes */
 };
+
+kvc_err slab_allocator_init(slab_allocator *sa);
+void    slab_allocator_destroy(slab_allocator *sa);
+void   *slab_alloc(slab_allocator *sa, size_t size);       /* NULL if > 1 MiB */
+void    slab_free(slab_allocator *sa, void *ptr, size_t size);
+size_t  slab_class_size(size_t size); /* smallest class >= size, 0 if too big */
 ```
+
+`kv_store` owns a `slab_allocator` and hands it to the hash map at init,
+so all entry memory lives in mmap'd slab pages.
 
 ### Phase 4 — LRU + expiry worker
 
@@ -261,7 +290,9 @@ typedef struct wal {
    `memcmp`, never `strcmp`.
 3. **Chaining over open addressing.** Entries are the unit of ownership for
    LRU (Phase 4) and slabs (Phase 3); chaining lets rehash rewire only
-   `next` pointers and keeps entry objects stable across overwrites.
+   `next` pointers and keeps entry objects stable across overwrites that
+   fit their slab chunk (a grow past the chunk migrates the entry, so
+   Phase 4 must relink LRU there).
 4. **Power-of-two buckets + FNV-1a.** `index = hash & (n - 1)` — no modulo.
    FNV-1a is fine for a cache; a DoS-resistant hash (SipHash) can be swapped
    in later with call sites localized in `hashmap.c`.
@@ -274,7 +305,8 @@ typedef struct wal {
    `MSG_NOSIGNAL` used where available; `EMFILE`/`ENFILE` backs off instead
    of spinning. Shutdown is signal-driven (`volatile sig_atomic_t` flag, no
    `SA_RESTART`) so blocking calls unwind cleanly.
-8. **Memory discipline.** All allocations go through `kvc_*` wrappers that
-   log `errno` and abort on OOM; every module has an explicit destroy that
-   frees everything, so the whole server is valgrind/ASan clean (see
-   `make valgrind` / `make sanitize`).
+8. **Memory discipline.** Entry storage is mmap'd slab pages (Phase 3)
+   with explicit `slab_allocator_destroy` teardown; everything else goes
+   through `kvc_*` wrappers that log `errno` and abort on OOM. Every
+   module has an explicit destroy, so the whole server is valgrind/ASan
+   clean (see `make valgrind` / `make sanitize`).
