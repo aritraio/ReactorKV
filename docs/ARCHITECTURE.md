@@ -28,7 +28,7 @@ loop is written against `epoll`/`kqueue` directly.
                                     ▼
 ┌─────────────────────────── COMMAND LAYER ───────────────────────────────┐
 │  kv_dispatch: command table {name, arity, handler, read/write}         │
-│    SET GET DEL EXPIRE INCR MGET INFO (+ PING for tooling)              │
+│    SET GET DEL EXPIRE PEXPIREAT INCR MGET INFO (+ PING for tooling)    │
 │  unknown commands & arity violations → Redis-style error replies        │
 └───────────────────────────────────┬─────────────────────────────────────┘
                                     ▼
@@ -56,7 +56,7 @@ flowchart TB
         P2[Phase 2+: epoll/kqueue reactor<br/>non-blocking conns, buffers, timers]
     end
     NET --> PROTO[Protocol Layer<br/>resp_parser incremental state machine<br/>resp_reply writer]
-    PROTO --> CMD[Command Layer<br/>kv_dispatch: SET GET DEL EXPIRE INCR MGET INFO PING]
+    PROTO --> CMD[Command Layer<br/>kv_dispatch: SET GET DEL EXPIRE PEXPIREAT INCR MGET INFO PING]
     CMD --> STORE[Store Engine<br/>kv_store facade]
     STORE --> HM[Hash map<br/>chained, FNV-1a, rehash]
     STORE --> EXP[Expiry<br/>Phase 1: lazy · Phase 4: worker + LRU]
@@ -89,15 +89,19 @@ re-runs the state machine against buffered bytes.
 | lru             | `include/kvstore/lru.h`, `src/lru.c` | Embedded doubly linked recency list (Phase 4): links live in each kv_entry |
 | hash map        | `include/kvstore/hashmap.h`, `src/hashmap.c` | Binary-safe chained hash table + load-factor rehash; atomic count/used-bytes; LRU membership maintenance |
 | protocol        | `include/kvstore/protocol.h`, `src/protocol.c` | Incremental RESP parser + reply writer               |
-| store           | `include/kvstore/store.h`, `src/store.c` | Command semantics, slab ownership, `pthread_rwlock`, maxmemory/allkeys-lru, expiry sweep (Phase 4) |
+| store           | `include/kvstore/store.h`, `src/store.c` | Command semantics, slab ownership, `pthread_rwlock`, maxmemory/allkeys-lru, expiry sweep (Phase 4), WAL DEL logging for store-driven removals + loading freeze (Phase 5) |
 | expire          | `include/kvstore/expire.h`, `src/expire.c` | Background expiry worker thread (Phase 4): bounded cursor sweep on a timer |
-| commands        | `include/kvstore/commands.h`, `src/commands.c` | Dispatch table, per-command handlers, read/write lock classification, INFO |
-| server          | `include/kvstore/server.h`, `src/server.c` | Socket lifecycle, reactor, per-conn I/O, worker start/stop, stats timer |
-| main            | `src/main.c`                 | Args (`-p -a -m -e`), signals, lifecycle                              |
+| commands        | `include/kvstore/commands.h`, `src/commands.c` | Dispatch table, per-command handlers, read/write lock classification, INFO, WAL record append (Phase 5), PEXPIREAT |
+| wal             | `include/kvstore/wal.h`, `src/wal.c` | Append-only RESP-form WAL (Phase 5): fsync policies, everysec flusher thread, startup replay with torn-tail truncation |
+| server          | `include/kvstore/server.h`, `src/server.c` | Socket lifecycle, reactor, per-conn I/O, worker start/stop, WAL open/replay/close (Phase 5), stats timer |
+| main            | `src/main.c`                 | Args (`-p -a -m -e --wal --fsync`), signals, lifecycle                  |
 
 Dependency direction: `main → server → commands → store → {hashmap →
 slab, lru}` and `store → expire` (the worker drives the store's sweep);
-`server → expire` (worker lifecycle). `server → protocol` for the parser.
+`server → expire` (worker lifecycle). Phase 5 adds `wal` beside `store`:
+`store` and `commands` append records to it (purge/eviction DELs and
+command records respectively), and `server` owns its lifecycle
+(open → replay → attach → close). `server → protocol` for the parser.
 Lower layers never depend on higher ones, so the protocol parser and
 store can be unit-tested and later reused by the event loop untouched.
 
@@ -146,7 +150,7 @@ fresh, larger chunk — the bucket link is rewired, `expire_at_ms` is
 carried across, LRU membership is moved, and the old chunk is returned
 to the slab.
 
-### Store facade (Phase 4 shape)
+### Store facade (Phase 4 + 5 shape)
 
 ```c
 /* store.h */
@@ -165,6 +169,8 @@ typedef struct kv_store {
     _Atomic uint64_t hits, misses, evictions;
     size_t           maxmemory;      /* eviction budget */
     size_t           expire_cursor;  /* rotating sweep cursor */
+    struct wal      *wal;        /* Phase 5: borrowed WAL, or NULL */
+    bool             loading;    /* Phase 5: startup replay in progress */
 } kv_store;
 ```
 
@@ -173,9 +179,9 @@ typedef struct kv_store {
 
 Concurrency contract (the whole of Phase 4's locking):
 - `kv_dispatch` takes the **read lock** for `GET`/`MGET`/`PING`/`INFO` and
-  the **write lock** for `SET`/`DEL`/`EXPIRE`/`INCR`, spanning the entire
-  handler. That is what keeps the value pointer `kv_store_get` returns
-  valid while the RESP reply bytes are copied from it.
+  the **write lock** for `SET`/`DEL`/`EXPIRE`/`PEXPIREAT`/`INCR`, spanning
+  the entire handler. That is what keeps the value pointer `kv_store_get`
+  returns valid while the RESP reply bytes are copied from it.
 - The data-path functions (`kv_store_set/get/del/expire/incr`) do **not**
   lock; their callers must. Only `kv_store_expire_cycle` and
   `kv_dispatch` acquire the lock (plus tests calling the helpers
@@ -323,19 +329,59 @@ single reactor thread, readers never contend with each other; the rwlock
 arbitrates the reactor against the worker. `expire_worker_stop()` (atomic
 flag + `pthread_join`) runs before `kv_store_destroy()`.
 
-### Phase 5 — WAL
+### Phase 5 — WAL (shipped)
 
 ```c
-/* wal.h (new in Phase 5) */
+/* wal.h */
+typedef enum {
+    WAL_FSYNC_ALWAYS = 0,   /* fsync() per mutating command (before reply) */
+    WAL_FSYNC_EVERYSEC = 1, /* default: background flusher thread ~1/s */
+    WAL_FSYNC_NO = 2        /* OS-managed flush while running */
+} wal_fsync_policy;
+
 typedef struct wal {
-    int    fd;
-    char  *path;
-    off_t  offset;
-    enum { WAL_FSYNC_EVERYSEC, WAL_FSYNC_ALWAYS, WAL_FSYNC_NO } policy;
+    int              fd;      /* O_RDWR | O_CREAT | O_APPEND */
+    char            *path;
+    wal_fsync_policy policy;
+    off_t            offset;  /* bytes logged (sole writers: reactor + worker) */
+    bool             opened;
+    pthread_t        thread;  /* everysec flusher */
+    atomic_bool      stop;
+    bool             flusher_started;
+    pthread_mutex_t  lock;    /* serializes wal_append across writers */
+    resp_reply       enc;     /* one staging buffer, reused per record */
+    uint64_t         replayed;  /* records applied at startup */
+    bool             truncated; /* a torn tail was cut off */
 } wal;
-/* Mutating commands (SET/DEL/EXPIRE/INCR) are appended in RESP form and
-   replayed at startup; the parser from Phase 1 doubles as the loader. */
+/* wal_open / wal_close / wal_append / wal_sync / wal_replay */
 ```
+
+**Records are the effective mutations, in RESP form.** The log stores the
+RESP multibulk command that *changed* the dataset, replayed at startup
+through the ordinary `kv_dispatch` pipeline (the Phase 1 parser doubles
+as the loader):
+
+- `SET` and `INCR` are logged verbatim after the store accepts them —
+  re-executing them against the preceding log state is deterministic.
+- `EXPIRE key secs` is translated to `PEXPIREAT key <epoch-ms>` at execute
+  time, so a restart hours later does not re-base the TTL.
+- Every store-driven removal — `DEL`, expiry-worker purges, and
+  `maxmemory` evictions — is appended as a `DEL` record by the store
+  itself, so replay cannot resurrect deleted or evicted keys.
+- `PEXPIREAT` is also a client command (Redis-compatible absolute TTL).
+
+**Replay semantics.** `kv_server_run` opens the WAL, replays into the
+store with `loading` set (which freezes expiry checks — the Redis AOF
+loading model), then attaches the log and starts serving. Because every
+runtime deletion is a logged `DEL`, applying records in order with expiry
+frozen reproduces the pre-crash dataset exactly; a key that expired but
+was never purged before the crash is resurrected and then reclaimed by
+the active worker, matching what would have happened without the crash.
+A torn tail (crash mid-append) is truncated to the last complete record;
+middle-of-file corruption refuses startup (fail-closed). Records can be
+appended from two threads (reactor command records + expiry-worker purge
+DELs), so `wal_append` is serialized by a mutex; the everysec flusher
+thread only ever calls `fsync`. A clean `wal_close` always fsyncs.
 
 ## Threading model evolution
 
@@ -391,3 +437,16 @@ typedef struct wal {
     through `kvc_*` wrappers that log `errno` and abort on OOM. Every
     module has an explicit destroy, so the whole server is valgrind/ASan
     clean (see `make valgrind` / `make sanitize`).
+12. **The WAL stores effective mutations, not raw commands (Phase 5).**
+    EXPIRE becomes absolute PEXPIREAT, and every store-driven removal is
+    logged as DEL — so replay through the ordinary dispatch table with
+    expiry checks frozen (`loading`) is byte-deterministic without a
+    snapshot. This is the Redis AOF model: deletion records make expiry a
+    logged event, and keys expired-but-not-yet-purged at crash time are
+    correctly resurrected then reclaimed by the worker.
+13. **fsync cost is a policy, not a bug (Phase 5).** `everysec` (default)
+    amortizes fsync behind a background flusher so write throughput only
+    pays the append `write()` (~−44% vs. no WAL in the bench); `always`
+    pays a synchronous fsync per mutation for the kill -9 guarantee
+    (~50k write ops/s on this machine); `no` defers flushing to the OS.
+    A clean shutdown fsyncs under every policy.

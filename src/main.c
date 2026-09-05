@@ -52,15 +52,29 @@ static long long parse_size(const char *s) {
     return v * mult;
 }
 
+/* Map a --fsync policy name to the enum; -1 when unknown. */
+static int parse_fsync_policy(const char *s) {
+    if (strcmp(s, "always") == 0) return WAL_FSYNC_ALWAYS;
+    if (strcmp(s, "everysec") == 0) return WAL_FSYNC_EVERYSEC;
+    if (strcmp(s, "no") == 0) return WAL_FSYNC_NO;
+    return -1;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s [-p PORT] [-a ADDR] [-m BYTES] [-e MS]\n"
+            "            [--wal PATH [--fsync POLICY]]\n"
             "  -p PORT       listen port (default 6379)\n"
             "  -a ADDR       bind address (default 127.0.0.1; '*' = all)\n"
             "  -m BYTES      maxmemory budget; evicts LRU tails past it\n"
             "                (0 = unlimited; suffixes k/m/g accepted)\n"
             "  -e MS         active-expiry worker cadence; 0 disables it\n"
             "                (default 100)\n"
+            "  --wal PATH    write-ahead log file (default: persistence off;\n"
+            "                mutating commands are appended in RESP form and\n"
+            "                replayed at startup)\n"
+            "  --fsync P     fsync policy when --wal is on: always | everysec\n"
+            "                (default) | no\n"
             "  -h            this help\n",
             prog);
 }
@@ -70,6 +84,8 @@ int main(int argc, char **argv) {
     const char *addr = "127.0.0.1";
     size_t maxmemory = 0;   /* 0 = unlimited */
     long expire_ms = KVC_EXPIRE_INTERVAL_MS_DEFAULT;
+    const char *wal_path = NULL;   /* NULL = persistence off */
+    int wal_policy = WAL_FSYNC_POLICY_DEFAULT;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) &&
@@ -94,6 +110,16 @@ int main(int argc, char **argv) {
                 return EXIT_FAILURE;
             }
             expire_ms = v;
+        } else if (strcmp(argv[i], "--wal") == 0 && i + 1 < argc) {
+            wal_path = argv[++i];
+        } else if (strcmp(argv[i], "--fsync") == 0 && i + 1 < argc) {
+            int p = parse_fsync_policy(argv[++i]);
+            if (p < 0) {
+                fprintf(stderr, "invalid fsync policy: %s "
+                        "(expected always | everysec | no)\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            wal_policy = p;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return EXIT_SUCCESS;
@@ -130,9 +156,21 @@ int main(int argc, char **argv) {
     }
     srv.maxmemory = maxmemory;
     srv.expire_interval_ms = expire_ms;
-    kvc_log(KVC_LOG_INFO, "kvstore ready on %s:%d (maxmemory=%zu bytes%s)",
-            addr, port, maxmemory,
-            expire_ms > 0 ? ", expiry worker on" : ", expiry worker off");
+    srv.wal_path = wal_path;
+    srv.wal_policy = (wal_fsync_policy)wal_policy;
+    if (wal_path != NULL) {
+        kvc_log(KVC_LOG_INFO,
+                "kvstore ready on %s:%d (maxmemory=%zu bytes%s, WAL: %s "
+                "fsync=%s)",
+                addr, port, maxmemory,
+                expire_ms > 0 ? ", expiry worker on" : ", expiry worker off",
+                wal_path, wal_policy_name((wal_fsync_policy)wal_policy));
+    } else {
+        kvc_log(KVC_LOG_INFO,
+                "kvstore ready on %s:%d (maxmemory=%zu bytes%s, WAL: off)",
+                addr, port, maxmemory,
+                expire_ms > 0 ? ", expiry worker on" : ", expiry worker off");
+    }
 
     int rc = kv_server_run(&srv);
 

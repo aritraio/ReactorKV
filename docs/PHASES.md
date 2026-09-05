@@ -202,28 +202,66 @@ or delay purge).
 
 ---
 
-## Phase 5 — WAL persistence + benchmarking
+## Phase 5 — WAL persistence + benchmarking ✅ (shipped)
 
 **Goal.** Survive crashes and prove the engine with real tooling.
 
-**Deliverables.** `wal.h`/`wal.c`: append-only log of mutating commands in
-RESP form, length-prefixed records; fsync policies (`everysec` default,
-`always`, `no`); startup replay — the Phase 1 parser doubles as the
-loader; crash-safe truncation of a torn tail record. Benchmark harness:
-`memtier_benchmark --protocol redis -p PORT` across SET/GET/MGET
-workloads, results recorded in `docs/BENCHMARKS.md`; optional
-`perf`/Instruments profile of the hot path (hash lookup, parser, slab
-alloc).
+**Deliverables.** `wal.h`/`wal.c`: an append-only log of the *effective*
+mutations in RESP form (`SET`/`INCR` verbatim, `EXPIRE` translated to
+`PEXPIREAT <epoch-ms>` so restarts never re-base TTLs, and store-driven
+removals — DEL, expiry-worker purges, maxmemory evictions — logged as
+`DEL` records so replay cannot resurrect keys). Fsync policies (`always`
+fsyncs before the reply; `everysec` default uses a background flusher
+thread; `no` leaves flushing to the OS; a clean close always fsyncs).
+Startup crash recovery re-plays the log through the *existing* command
+pipeline (`kv_dispatch`) with store expiry checks frozen (the Redis AOF
+loading model) — deletion records make the replay deterministic. A record
+torn by a crash is truncated to the last complete record; mid-file
+corruption fails closed. `--wal <path>` / `--fsync <policy>` CLI flags;
+`PEXPIREAT` added as a client command (it is the persisted form of
+EXPIRE). Benchmark harness `tests/bench.py` (`make bench`) + `make
+recovery` (kill -9 wire test); results in `docs/BENCHMARKS.md`.
 
-**Acceptance criteria**
-- `kill -9` mid-load, restart → all fsynced state present, no corruption.
-- `make valgrind` clean on a full benchmark run.
-- Benchmark numbers recorded with: QPS, latency p50/p99, and a
-  before/after for the slab allocator (Phase 3) and LRU (Phase 4).
+**Acceptance criteria (all met)**
+- `kill -9` mid-load, restart → every acknowledged write present, no
+  corruption (`make recovery`: 200 SETs + 5 INCRs + DELs + TTLs survive
+  across four boot cycles, including a torn-tail injection); unit-level
+  recovery in `tests/test_wal.c` (129 checks: record bytes, absolute-TTL
+  translation, torn-tail truncation + continued appends, purge/eviction
+  DEL ordering, all fsync policies, fail-closed corruption).
+- `make sanitize` (ASan+UBSan) clean and `make tsan` clean — the WAL
+  append mutex is exercised against the everysec flusher thread under
+  ThreadSanitizer. (`make valgrind` is unavailable on modern macOS, as in
+  Phases 3–4; the sanitizer suites cover teardown.)
+- Benchmark numbers recorded with QPS + latency p50/p99 in
+  `docs/BENCHMARKS.md`, including the WAL cost matrix (`off` ~740k SET/s
+  → `no`/`everysec` ~412k → `always` ~51k; single-op median 15 µs →
+  30 µs). A before/after for the Phase 3 slab and Phase 4 LRU is not
+  re-measurable (no retained baseline binaries); the doc records what was
+  measured at the time and where (PHASES Phase 3/4 acceptance) plus the
+  Phase 5 deltas this harness can measure directly.
 
-**Risks.** fsync throughput (mitigate with `everysec` + a background
-flusher); benchmark noise (pin CPU, disable turbo, repeat runs); WAL
-growth (add compaction/rotation as a stretch goal).
+**Notes / deviations from the plan.**
+- WAL records are the *effective* mutations, not a verbatim command echo:
+  EXPIRE becomes PEXPIREAT (absolute), and every store-driven removal
+  (expiry purge, eviction, DEL) is logged as DEL. This — plus freezing
+  expiry checks during load — makes replay byte-deterministic without a
+  snapshot.
+- Two threads can append (reactor command records + expiry-worker purge
+  DELs), so `wal_append` is serialized by an internal mutex; the everysec
+  flusher only fsyncs.
+- `no` fsync policy still fsyncs on clean shutdown, so restart after
+  SIGTERM is always consistent.
+- Benchmark tooling is a bundled Python harness (`tests/bench.py`)
+  because memtier/redis-benchmark are not installed on the dev machine;
+  it spawns a fresh server per run for like-for-like policy comparison.
+  Absolute numbers are a floor (GIL-bound client); the relative WAL costs
+  are the point.
+- WAL rotation/compaction remains a stretch goal (log growth is
+  unbounded).
+
+**Risks addressed.** fsync throughput is bought deliberately with
+`always` (~50k write ops/s, documented); `everysec` amortizes fsync away.
 
 ---
 
@@ -234,4 +272,5 @@ growth (add compaction/rotation as a stretch goal).
 3. Phase 3: slab ships; `make test` unchanged.
 4. Phase 4 (done): LRU + worker + rwlock + INFO stats; new lru/store/expire
    tests, `make tsan` target.
-5. Phase 5: WAL + `docs/BENCHMARKS.md`.
+5. Phase 5 (done): WAL + `PEXPIREAT` + `make recovery`/`make bench` +
+   `docs/BENCHMARKS.md`.

@@ -71,6 +71,10 @@ kvc_err kv_server_init(kv_server *srv, const char *addr, int port) {
     srv->expire_sample = KVC_EXPIRE_SAMPLE_DEFAULT;
     atomic_init(&srv->expire.stop, false);
 
+    /* Phase 5: persistence off unless --wal is given; everysec fsync. */
+    srv->wal_path = NULL;
+    srv->wal_policy = WAL_FSYNC_POLICY_DEFAULT;
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         kvc_log(KVC_LOG_ERR, "socket(): %s", strerror(errno));
@@ -112,10 +116,37 @@ kvc_err kv_server_init(kv_server *srv, const char *addr, int port) {
     return KVC_OK;
 }
 
+/* Startup replay callback: apply one WAL record through the ordinary
+   command pipeline. The store is in `loading` mode (expiry frozen, no
+   WAL appends) and no worker/clients exist yet; kv_dispatch takes the
+   store write lock per record, which is harmless single-threaded. Any
+   error reply or nonzero dispatch rc means the record could not be
+   applied — a corrupted log must stop the server rather than serve a
+   half-replayed dataset. */
+static kvc_err replay_apply(void *ctx, int argc, char **argv,
+                            const size_t *argvlen) {
+    kv_store *s = (kv_store *)ctx;
+    resp_reply r;
+    resp_reply_init(&r);
+    kvc_err rc = kv_dispatch(s, argc, argv, argvlen, &r);
+    bool bad = rc != KVC_OK || (r.len > 0 && r.buf[0] == '-');
+    if (bad) {
+        kvc_log(KVC_LOG_ERR,
+                "WAL record rejected during replay (%.*s)",
+                r.len > 0 ? (int)r.len : 0,
+                r.len > 0 ? r.buf : "no reply");
+    }
+    resp_reply_destroy(&r);
+    return bad ? KVC_ERR_IO : KVC_OK;
+}
+
 void kv_server_destroy(kv_server *srv) {
     if (srv == NULL) return;
-    /* Stop the active expiry worker before touching the store it reads. */
+    /* Stop the active expiry worker before touching the store it reads,
+       then seal the WAL (join the everysec flusher, final fsync). */
     expire_worker_stop(&srv->expire);
+    kv_store_set_wal(&srv->store, NULL);
+    wal_close(&srv->wal);
     if (srv->el != NULL) {
         kv_evloop_destroy(srv->el);
         srv->el = NULL;
@@ -474,9 +505,31 @@ int kv_server_run(kv_server *srv) {
         return 1;
     }
 
-    /* Phase 4: apply the memory budget and start the active expiry
-       worker. kv_server_destroy() stops it (before the store dies). */
+    /* Phase 4: apply the memory budget. */
     kv_store_set_maxmemory(&srv->store, srv->maxmemory);
+
+    /* Phase 5: open the WAL, crash-recover by replay, then attach it so
+       every mutation is logged while serving. Replay happens before the
+       expiry worker starts and before any client is accepted. */
+    if (srv->wal_path != NULL) {
+        if (wal_open(&srv->wal, srv->wal_path, srv->wal_policy) != KVC_OK) {
+            return 1;
+        }
+        srv->store.loading = true;
+        kvc_err rrc = wal_replay(&srv->wal, replay_apply, &srv->store);
+        srv->store.loading = false;
+        if (rrc != KVC_OK) {
+            kvc_log(KVC_LOG_ERR,
+                    "WAL recovery failed; refusing to serve on %s",
+                    srv->wal_path);
+            wal_close(&srv->wal);
+            return 1;
+        }
+        kv_store_set_wal(&srv->store, &srv->wal);
+    }
+
+    /* Phase 4: start the active expiry worker. kv_server_destroy() stops
+       it (before the store dies). */
     if (expire_worker_start(&srv->expire, &srv->store,
                             srv->expire_interval_ms,
                             srv->expire_sample) != KVC_OK) {

@@ -14,6 +14,7 @@
 #include "evloop.h"
 #include "expire.h"
 #include "store.h"
+#include "wal.h"
 
 /* Cap on simultaneous connections (fd exhaustion mitigation). Because
    conn structs are recycled from a free list, memory stays flat at peak
@@ -42,6 +43,13 @@ typedef struct kv_server {
     long          expire_interval_ms;/* worker cadence; 0 disables */
     size_t        expire_sample;     /* keys sampled per worker pass */
     expire_worker expire;            /* active expiry worker */
+
+    /* Phase 5 persistence. wal_path == NULL keeps the store in-memory
+       only; otherwise the WAL is opened + replayed in kv_server_run
+       (before any client is served) and attached to the store. */
+    const char      *wal_path;   /* borrowed from argv (main.c) */
+    wal_fsync_policy wal_policy; /* WAL_FSYNC_POLICY_DEFAULT */
+    wal             wal;         /* the log (opened in kv_server_run) */
 } kv_server;
 
 /* Create the listening socket (SO_REUSEADDR, bind, listen, non-blocking).

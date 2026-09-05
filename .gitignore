@@ -7,4 +7,5 @@ tests/test_slab
 tests/test_lru
 tests/test_store
 tests/test_expire
+tests/test_wal
 *.dSYM/

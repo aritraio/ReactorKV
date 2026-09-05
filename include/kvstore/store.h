@@ -63,7 +63,14 @@ typedef struct kv_store {
     _Atomic uint64_t evictions;
     size_t           maxmemory; /* Phase 4: bytes, 0 = unlimited */
     size_t           expire_cursor; /* Phase 4: sweep position (under wrlock) */
-    /* Phase 5: wal *wal; */
+
+    /* Phase 5: write-ahead log (borrowed; the server owns it). When set,
+       every mutation that removes an entry (DEL, expiry purge, maxmemory
+       eviction) is appended as a DEL record, and command handlers append
+       their own records after applying. While `loading` is true (startup
+       replay) expiry checks are frozen and no records are appended. */
+    struct wal *wal;
+    bool         loading; /* Phase 5: replay in progress */
 } kv_store;
 
 kvc_err kv_store_init(kv_store *s, size_t nbuckets);
@@ -99,6 +106,14 @@ kvc_err kv_store_del(kv_store *s, const char *const *keys, const size_t *key_len
    A non-positive ttl_ms deletes the key and returns 1 (Redis semantics).
    (write lock) */
 int kv_store_expire(kv_store *s, const char *key, size_t key_len, int64_t ttl_ms);
+/* PEXPIREAT: set the expiry to an absolute epoch-ms. Returns 1 if the key
+   existed (now has that TTL), 0 otherwise. An absolute time already in
+   the past deletes the key (Redis semantics). During startup replay
+   (s->loading) the expiry is stored verbatim even when already past — the
+   active worker reclaims it after load — so replayed records reproduce
+   the pre-crash dataset exactly. (write lock) */
+int kv_store_expireat(kv_store *s, const char *key, size_t key_len,
+                      int64_t abs_ms);
 /* INCR. Strict integer parse; new value in *out. KVC_ERR_INVAL on a
    non-integer value or overflow. A missing key starts at 0. TTL is kept.
    (write lock) */
@@ -112,5 +127,9 @@ void    kv_store_stats(const kv_store *s, kv_stats *out);
    entries are examined for expired keys per pass (Redis-style sampling with
    a rotating bucket cursor, so all keys are eventually covered). */
 void kv_store_expire_cycle(kv_store *s, size_t sample_limit);
+
+/* Attach (or detach with NULL) the write-ahead log. Called by the server
+   after startup replay; must not run concurrently with data-path calls. */
+void kv_store_set_wal(kv_store *s, struct wal *w);
 
 #endif /* KVC_STORE_H */

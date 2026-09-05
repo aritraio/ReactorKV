@@ -6,8 +6,8 @@ portfolio: non-blocking event-driven I/O (`epoll`/`kqueue`), a subset of
 the Redis RESP protocol, a custom allocator, reader-writer-locked
 concurrency, and LRU eviction — all without third-party event libraries.
 
-**Status: Phases 1–4 complete** (see [docs/PHASES.md](docs/PHASES.md) for
-the full 5-phase plan).
+**Status: Phases 1–5 complete** (see [docs/PHASES.md](docs/PHASES.md) for
+the full plan).
 
 ## Features (Phase 1)
 
@@ -79,15 +79,40 @@ the full 5-phase plan).
   `used_memory`, and `maxmemory` (atomic counters, lock-free to read);
   the server also logs them every 5 s.
 
+## Features (Phase 5)
+
+- **Write-ahead log**: every mutation that changes the dataset is appended
+  to a WAL file as the RESP multibulk command that produced it
+  (`SET`/`INCR`/`PEXPIREAT`/`DEL`), so startup recovery just re-plays the
+  log through the ordinary command pipeline. Enabled with
+  `--wal <path>`.
+- **Absolute TTLs**: `EXPIRE key secs` is logged as
+  `PEXPIREAT key <epoch-ms>`, so a restart hours later does not re-base
+  the key's TTL. (`PEXPIREAT` is also a client-usable command.)
+- **Store-driven DELs are logged too**: `DEL`, expiry-worker purges, and
+  `maxmemory` evictions all land in the log, so a crash cannot resurrect
+  deleted or evicted keys.
+- **Fsync policies**: `--fsync always|everysec|no` (default `everysec`,
+  background flusher thread). `always` fsyncs before the reply — an
+  acknowledged write survives `kill -9`. A clean shutdown always fsyncs.
+- **Crash-safe replay**: the log is parsed with the same incremental RESP
+  parser the reactor uses; a record torn by a crash is truncated to the
+  last complete record and the log stays appendable. Mid-file corruption
+  refuses startup rather than serving a half-replayed dataset.
+- **Benchmark harness**: `tests/bench.py` (spawns its own server per run)
+  and `make bench`; results in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Build
 
 ```sh
 make            # builds ./kvstore
-make test       # unit tests (hashmap, protocol, slab, lru, store, expire)
+make test       # unit tests (hashmap, protocol, slab, lru, store, expire, wal)
 make smoke      # end-to-end test over real TCP sockets
 make stress     # smoke + 1,000 concurrent pipelined connections
 make sanitize   # rebuild tests with AddressSanitizer + UBSan, run them
-make tsan       # rebuild the Phase 4 concurrency tests with ThreadSanitizer
+make tsan       # rebuild the concurrency tests with ThreadSanitizer
+make recovery   # kill -9 crash / restart durability test (WAL)
+make bench      # benchmark harness (see docs/BENCHMARKS.md)
 make valgrind   # run tests under valgrind (leak-check=full)
 ```
 
@@ -102,6 +127,9 @@ macOS).
 ./kvstore -a 0.0.0.0 -p 7379
 ./kvstore -m 256m          # cap memory at 256 MiB, evict LRU tails past it
 ./kvstore -e 0             # disable the active expiry worker
+./kvstore --wal /tmp/rdb.wal               # persist mutations (everysec)
+./kvstore --wal /tmp/rdb.wal --fsync always  # ack = durable against kill -9
+./kvstore --wal /tmp/rdb.wal --fsync no       # OS-managed flush while running
 ```
 
 Then, in another terminal:
@@ -111,20 +139,23 @@ redis-cli -p 7379 set foo bar
 redis-cli -p 7379 get foo      # "bar"
 redis-cli -p 7379 incr counter # (integer) 1
 redis-cli -p 7379 expire foo 60
+redis-cli -p 7379 pexpireat foo 9999999999999  # absolute ms, Redis-compatible
 redis-cli -p 7379 mget foo counter
-redis-cli -p 7379 info        # keys / hits / misses / evictions
+redis-cli -p 7379 info        # keys / hits / misses / evictions / wal_enabled
 ```
 
-Ctrl-C (or `kill -TERM`) shuts the server down cleanly.
+Ctrl-C (or `kill -TERM`) shuts the server down cleanly; with `--wal` it
+fsyncs the log on the way out.
 
 ## Project layout
 
 ```
 include/kvstore/   public headers (one per module)
 src/               implementations
-tests/             unit tests + smoke.py (end-to-end socket test)
+tests/             unit tests + smoke.py, recovery.py, bench.py
 docs/              ARCHITECTURE.md (diagrams, structs, design decisions)
                    PHASES.md (5-phase roadmap)
+                   BENCHMARKS.md (measured throughput/latency, WAL cost)
 ```
 
 Phase 2 serves thousands of concurrent clients from one thread — the Redis
@@ -140,7 +171,9 @@ slotted into the reactor unchanged.
 3. **Phase 3 (done)** — slab allocator (fixed-size classes, no heap fragmentation).
 4. **Phase 4 (done)** — LRU eviction (`maxmemory`/allkeys-lru), active
    expiry worker, `pthread_rwlock` concurrency, stats instrumentation.
-5. **Phase 5** — WAL persistence + `memtier_benchmark` benchmarking.
+5. **Phase 5 (done)** — WAL persistence (RESP-form records, fsync
+   policies, crash-safe replay) + benchmark harness (`tests/bench.py`,
+   results in docs/BENCHMARKS.md).
 
 Details, diagrams, and exact struct layouts in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
